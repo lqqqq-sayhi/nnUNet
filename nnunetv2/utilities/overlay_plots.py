@@ -28,24 +28,32 @@ from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager
 from nnunetv2.utilities.utils import get_identifiers_from_splitted_dataset_folder, \
     get_filenames_of_train_images_and_targets
 
+# color_cycle = (
+#     "000000",
+#     "4363d8",
+#     "f58231",
+#     "3cb44b",
+#     "e6194B",
+#     "911eb4",
+#     "ffe119",
+#     "bfef45",
+#     "42d4f4",
+#     "f032e6",
+#     "000075",
+#     "9A6324",
+#     "808000",
+#     "800000",
+#     "469990",
+# )
+# QL modify
 color_cycle = (
-    "000000",
-    "4363d8",
-    "f58231",
-    "3cb44b",
-    "e6194B",
-    "911eb4",
-    "ffe119",
-    "bfef45",
-    "42d4f4",
-    "f032e6",
-    "000075",
-    "9A6324",
-    "808000",
-    "800000",
-    "469990",
+    "000000", 
+    "33FFFF", "0033CC", "33FFFF", "0033CC", "33FFFF", "0033CC",
+    "33FFFF", "0033CC", "33FFFF", "00FF00", "0033CC", "33FFFF",
+    "00FF00", "0033CC", "33FFFF", "00FF00", "0033CC", "33FFFF",
+    "0033CC", "3399FF", "FFFF00", "FFCC00", "333366", "CC33CC",
+    "FFCCCC", "CC0000", "FF6666", "55007f"
 )
-
 
 def hex_to_rgb(hex: str):
     assert len(hex) == 6
@@ -125,7 +133,11 @@ def select_slice_to_plot2(image: np.ndarray, segmentation: np.ndarray) -> int:
         fg_mask = segmentation == c
         fg_per_slice[:, i] = fg_mask.sum((1, 2))
         fg_per_slice[:, i] /= fg_per_slice.sum()
-    fg_per_slice = fg_per_slice.mean(1)
+    # QL modify (RuntimeWarning: Mean of empty slice) fg_per_slice = fg_per_slice.mean(1)
+    if fg_per_slice.sum() > 0:
+        fg_per_slice = fg_per_slice.mean(1)
+    else:
+        fg_per_slice = 0
     return int(np.argmax(fg_per_slice))
 
 

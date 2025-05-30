@@ -85,6 +85,10 @@ ENV/
 # Spyder project settings
 .spyderproject
 
+# dir
+dataset/
+predict_results/
+
 # Rope project settings
 .ropeproject
 
