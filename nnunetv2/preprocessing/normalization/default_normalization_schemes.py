@@ -39,6 +39,8 @@ class ZScoreNormalization(ImageNormalization):
             # The default nnU-net sets use_mask_for_norm to True if cropping to the nonzero region substantially
             # reduced the image size.
             mask = seg >= 0
+            # Negative values are used to mark areas that need to be ignored, rather than the '0'.
+            # Both 0 and positive integers are considered foreground regions.
             mean = image[mask].mean()
             std = image[mask].std()
             image[mask] = (image[mask] - mean) / (max(std, 1e-8))
