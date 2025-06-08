@@ -576,7 +576,7 @@ class nnUNetTrainer(object):
             if not isfile(splits_file):
                 self.print_to_log_file("Creating new 5-fold cross-validation split...")
                 all_keys_sorted = list(np.sort(list(dataset.identifiers)))
-                splits = generate_crossval_split(all_keys_sorted, seed=12345, n_splits=5)
+                splits = generate_crossval_split(all_keys_sorted, seed=301, n_splits=5)
                 save_json(splits, splits_file)
 
             else:
@@ -595,7 +595,7 @@ class nnUNetTrainer(object):
                                        "contain only %d folds. I am now creating a "
                                        "random (but seeded) 80:20 split!" % (self.fold, len(splits)))
                 # if we request a fold that is not in the split file, create a random 80:20 split
-                rnd = np.random.RandomState(seed=12345 + self.fold)
+                rnd = np.random.RandomState(seed=301 + self.fold)
                 keys = np.sort(list(dataset.identifiers))
                 idx_tr = rnd.choice(len(keys), int(len(keys) * 0.8), replace=False)
                 idx_val = [i for i in range(len(keys)) if i not in idx_tr]
