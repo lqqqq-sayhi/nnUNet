@@ -1111,7 +1111,10 @@ class nnUNetTrainer(object):
         else:
             loss_here = np.mean(outputs_collated['loss'])
 
-        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+        # global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+        global_dc_per_class = [1.0 if (2 * i + j + k) == 0 else 2 * i / (2 * i + j + k) 
+                               for i, j, k in zip(tp, fp, fn)
+                               ]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
