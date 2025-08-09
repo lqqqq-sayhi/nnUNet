@@ -97,6 +97,8 @@ predict_results/
 *.zip
 *.npz
 *.npy
+*.pkl
+*.log
 *.jpg
 *.jpeg
 .idea
@@ -109,7 +111,6 @@ predict_results/
 *.bmp
 *.pkl
 *.xml
-*.pkl
 *.pdf
 *.png
 *.jpg

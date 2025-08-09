@@ -1,4 +1,3 @@
-import csv
 import inspect
 import itertools
 import multiprocessing
@@ -7,7 +6,6 @@ from copy import deepcopy
 from queue import Queue
 from threading import Thread
 from time import sleep
-import time
 from typing import Tuple, Union, List, Optional
 
 import numpy as np
@@ -65,9 +63,6 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
-        self.total_start_time = None  # 添加总开始时间
-        self.inference_times = []     # 存储每个案例的推理时间
-
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -75,7 +70,6 @@ class nnUNetPredictor(object):
         """
         This is used when making predictions with a trained model
         """
-
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
@@ -86,9 +80,6 @@ class nnUNetPredictor(object):
         if isinstance(use_folds, str):
             use_folds = [use_folds]
 
-        # 记录模型加载开始时间
-        self.total_start_time = time.time()
-        
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
@@ -136,10 +127,7 @@ class nnUNetPredictor(object):
                 and not isinstance(self.network, OptimizedModule):
             print('Using torch.compile')
             self.network = torch.compile(self.network)
-        # 记录模型加载结束时间
-        model_loading_time = time.time() - self.total_start_time
-        print(f'model_loading_time: Model loaded in {model_loading_time:.4f} seconds')
-        
+
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
                               dataset_json: dict, trainer_name: str,
@@ -358,24 +346,6 @@ class nnUNetPredictor(object):
                                                             num_processes)
         return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
 
-    def save_timing_info(self, timing_info):
-        """保存时间信息到CSV文件"""
-        if not timing_info:
-            return
-            
-        # 确定输出路径（使用预测输出目录）
-        output_dir = self.output_folder if hasattr(self, 'output_folder') else os.getcwd()
-        csv_path = os.path.join(output_dir, 'inference_timing.csv')
-        
-        with open(csv_path, 'w', newline='') as f:
-            fieldnames = ['case_id', 'inference_time', 'case_time', 'preprocessing_time']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for info in timing_info:
-                writer.writerow(info)
-        
-        print(f"Saved timing info to: {csv_path}")
-        
     def predict_from_data_iterator(self,
                                    data_iterator,
                                    save_probabilities: bool = False,
@@ -384,17 +354,10 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
-        # 创建时间记录列表
-        timing_info = []
-        case_ids = []
-
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
             for preprocessed in data_iterator:
-                
-                case_start_time = time.time()  # 记录案例开始时间
-
                 data = preprocessed['data']
                 if isinstance(data, str):
                     delfile = data
@@ -411,10 +374,6 @@ class nnUNetPredictor(object):
 
                 properties = preprocessed['data_properties']
 
-                # 获取案例ID（使用输出文件名或生成唯一ID）
-                case_id = os.path.basename(preprocessed['ofile']) if preprocessed['ofile'] else f"case_{len(timing_info)}"
-                case_ids.append(case_id)
-
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
@@ -423,19 +382,7 @@ class nnUNetPredictor(object):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                # prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
-                # 修改调用，接收推理时间和预测结果
-                prediction, inference_time = self.predict_logits_from_preprocessed_data(data)
-                
-                case_time = time.time() - case_start_time  # 计算总处理时间
-
-                # 记录时间信息
-                timing_info.append({
-                    'case_id': case_id,
-                    'inference_time': inference_time,
-                    'case_time': case_time,
-                    'preprocessing_time': case_time - inference_time
-                })
+                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -470,10 +417,6 @@ class nnUNetPredictor(object):
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
-
-        # 保存时间信息到CSV文件
-        self.save_timing_info(timing_info)
-
         return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
@@ -532,12 +475,9 @@ class nnUNetPredictor(object):
         RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
         SEE convert_predicted_logits_to_segmentation_with_correct_shape
         """
-        
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
-
-        start_time = time.time()  # 记录开始时间
 
         for params in self.list_of_parameters:
 
@@ -558,15 +498,9 @@ class nnUNetPredictor(object):
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
 
-        inference_time = time.time() - start_time  # 计算推理时间
-        self.inference_times.append(inference_time)  # 存储推理时间
-        print(f'Inference time: {inference_time:.4f} seconds')
-
-        if self.verbose: 
-            print('Prediction done')
+        if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
-
-        return prediction, inference_time  
+        return prediction
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
