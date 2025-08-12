@@ -1,3 +1,4 @@
+import csv
 import inspect
 import itertools
 import multiprocessing
@@ -6,6 +7,7 @@ from copy import deepcopy
 from queue import Queue
 from threading import Thread
 from time import sleep
+import time
 from typing import Tuple, Union, List, Optional
 
 import numpy as np
@@ -63,6 +65,9 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
+        self.total_start_time = None  # 添加总开始时间
+        self.inference_times = []     # 存储每个案例的推理时间
+
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -70,6 +75,7 @@ class nnUNetPredictor(object):
         """
         This is used when making predictions with a trained model
         """
+
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
@@ -80,6 +86,9 @@ class nnUNetPredictor(object):
         if isinstance(use_folds, str):
             use_folds = [use_folds]
 
+        # 记录模型加载开始时间
+        self.total_start_time = time.time()
+        
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
@@ -125,6 +134,34 @@ class nnUNetPredictor(object):
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
                 and not isinstance(self.network, OptimizedModule):
+            print('Using torch.compile')
+            self.network = torch.compile(self.network)
+        # 记录模型加载结束时间
+        model_loading_time = time.time() - self.total_start_time
+        print(f'model_loading_time: Model loaded in {model_loading_time:.4f} seconds')
+        
+    def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
+                              configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
+                              dataset_json: dict, trainer_name: str,
+                              inference_allowed_mirroring_axes: Optional[Tuple[int, ...]]):
+        """
+        This is used by the nnUNetTrainer to initialize nnUNetPredictor for the final validation
+        """
+        self.plans_manager = plans_manager
+        self.configuration_manager = configuration_manager
+        self.list_of_parameters = parameters
+        self.network = network
+        self.dataset_json = dataset_json
+        self.trainer_name = trainer_name
+        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
+        self.label_manager = plans_manager.get_label_manager(dataset_json)
+        allow_compile = True
+        allow_compile = allow_compile and ('nnUNet_compile' in os.environ.keys()) and (
+                    os.environ['nnUNet_compile'].lower() in ('true', '1', 't'))
+        allow_compile = allow_compile and not isinstance(self.network, OptimizedModule)
+        if isinstance(self.network, DistributedDataParallel):
+            allow_compile = allow_compile and isinstance(self.network.module, OptimizedModule)
+        if allow_compile:
             print('Using torch.compile')
             self.network = torch.compile(self.network)
 
@@ -231,6 +268,10 @@ class nnUNetPredictor(object):
                                                 output_folder_or_list_of_truncated_output_files,
                                                 folder_with_segs_from_prev_stage, overwrite, part_id, num_parts,
                                                 save_probabilities)
+        
+        # import pdb
+        # pdb.set_trace()
+        
         if len(list_of_lists_or_source_folder) == 0:
             return
 
@@ -240,6 +281,29 @@ class nnUNetPredictor(object):
                                                                                  num_processes_preprocessing)
 
         return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+
+    def _internal_get_data_iterator_from_lists_of_filenames(self,
+                                                            input_list_of_lists: List[List[str]],
+                                                            seg_from_prev_stage_files: Union[List[str], None],
+                                                            output_filenames_truncated: Union[List[str], None],
+                                                            num_processes: int):
+        return preprocessing_iterator_fromfiles(input_list_of_lists, seg_from_prev_stage_files,
+                                                output_filenames_truncated, self.plans_manager, self.dataset_json,
+                                                self.configuration_manager, num_processes, self.device.type == 'cuda',
+                                                self.verbose_preprocessing)
+        # preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose_preprocessing)
+        # # hijack batchgenerators, yo
+        # # we use the multiprocessing of the batchgenerators dataloader to handle all the background worker stuff. This
+        # # way we don't have to reinvent the wheel here.
+        # num_processes = max(1, min(num_processes, len(input_list_of_lists)))
+        # ppa = PreprocessAdapter(input_list_of_lists, seg_from_prev_stage_files, preprocessor,
+        #                         output_filenames_truncated, self.plans_manager, self.dataset_json,
+        #                         self.configuration_manager, num_processes)
+        # if num_processes == 0:
+        #     mta = SingleThreadedAugmenter(ppa, None)
+        # else:
+        #     mta = MultiThreadedAugmenter(ppa, None, num_processes, 1, None, pin_memory=pin_memory)
+        # return mta
 
     def get_data_iterator_from_raw_npy_data(self,
                                             image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
@@ -279,31 +343,43 @@ class nnUNetPredictor(object):
         )
 
         return pp
+
+    def predict_from_list_of_npy_arrays(self,
+                                        image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
+                                        segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None,
+                                                                                                    np.ndarray,
+                                                                                                    List[
+                                                                                                        np.ndarray]],
+                                        properties_or_list_of_properties: Union[dict, List[dict]],
+                                        truncated_ofname: Union[str, List[str], None],
+                                        num_processes: int = 3,
+                                        save_probabilities: bool = False,
+                                        num_processes_segmentation_export: int = default_num_processes):
+        iterator = self.get_data_iterator_from_raw_npy_data(image_or_list_of_images,
+                                                            segs_from_prev_stage_or_list_of_segs_from_prev_stage,
+                                                            properties_or_list_of_properties,
+                                                            truncated_ofname,
+                                                            num_processes)
+        return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
+
+    def save_timing_info(self, timing_info):
+        """保存时间信息到CSV文件"""
+        if not timing_info:
+            return
+            
+        # 确定输出路径（使用预测输出目录）
+        output_dir = self.output_folder if hasattr(self, 'output_folder') else os.getcwd()
+        csv_path = os.path.join(output_dir, 'inference_timing.csv')
         
-    def _internal_get_data_iterator_from_lists_of_filenames(self,
-                                                            input_list_of_lists: List[List[str]],
-                                                            seg_from_prev_stage_files: Union[List[str], None],
-                                                            output_filenames_truncated: Union[List[str], None],
-                                                            num_processes: int):
-        return preprocessing_iterator_fromfiles(input_list_of_lists, seg_from_prev_stage_files,
-                                                output_filenames_truncated, self.plans_manager, self.dataset_json,
-                                                self.configuration_manager, num_processes, self.device.type == 'cuda',
-                                                self.verbose_preprocessing)
-        # preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose_preprocessing)
-        # # hijack batchgenerators, yo
-        # # we use the multiprocessing of the batchgenerators dataloader to handle all the background worker stuff. This
-        # # way we don't have to reinvent the wheel here.
-        # num_processes = max(1, min(num_processes, len(input_list_of_lists)))
-        # ppa = PreprocessAdapter(input_list_of_lists, seg_from_prev_stage_files, preprocessor,
-        #                         output_filenames_truncated, self.plans_manager, self.dataset_json,
-        #                         self.configuration_manager, num_processes)
-        # if num_processes == 0:
-        #     mta = SingleThreadedAugmenter(ppa, None)
-        # else:
-        #     mta = MultiThreadedAugmenter(ppa, None, num_processes, 1, None, pin_memory=pin_memory)
-        # return mta
-
-
+        with open(csv_path, 'w', newline='') as f:
+            fieldnames = ['case_id', 'inference_time', 'case_time', 'preprocessing_time']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for info in timing_info:
+                writer.writerow(info)
+        
+        print(f"Saved timing info to: {csv_path}")
+        
     def predict_from_data_iterator(self,
                                    data_iterator,
                                    save_probabilities: bool = False,
@@ -312,10 +388,17 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+        # 创建时间记录列表
+        timing_info = []
+        case_ids = []
+
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
             for preprocessed in data_iterator:
+                
+                case_start_time = time.time()  # 记录案例开始时间
+
                 data = preprocessed['data']
                 if isinstance(data, str):
                     delfile = data
@@ -332,6 +415,10 @@ class nnUNetPredictor(object):
 
                 properties = preprocessed['data_properties']
 
+                # 获取案例ID（使用输出文件名或生成唯一ID）
+                case_id = os.path.basename(preprocessed['ofile']) if preprocessed['ofile'] else f"case_{len(timing_info)}"
+                case_ids.append(case_id)
+
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
@@ -340,7 +427,19 @@ class nnUNetPredictor(object):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                # prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                # 修改调用，接收推理时间和预测结果
+                prediction, inference_time = self.predict_logits_from_preprocessed_data(data)
+                
+                case_time = time.time() - case_start_time  # 计算总处理时间
+
+                # 记录时间信息
+                timing_info.append({
+                    'case_id': case_id,
+                    'inference_time': inference_time,
+                    'case_time': case_time,
+                    'preprocessing_time': case_time - inference_time
+                })
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -375,7 +474,58 @@ class nnUNetPredictor(object):
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
+
+        # 保存时间信息到CSV文件
+        self.save_timing_info(timing_info)
+
         return ret
+
+    def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
+                                 segmentation_previous_stage: np.ndarray = None,
+                                 output_file_truncated: str = None,
+                                 save_or_return_probabilities: bool = False):
+        """
+        WARNING: SLOW. ONLY USE THIS IF YOU CANNOT GIVE NNUNET MULTIPLE IMAGES AT ONCE FOR SOME REASON.
+
+
+        input_image: Make sure to load the image in the way nnU-Net expects! nnU-Net is trained on a certain axis
+                     ordering which cannot be disturbed in inference,
+                     otherwise you will get bad results. The easiest way to achieve that is to use the same I/O class
+                     for loading images as was used during nnU-Net preprocessing! You can find that class in your
+                     plans.json file under the key "image_reader_writer". If you decide to freestyle, know that the
+                     default axis ordering for medical images is the one from SimpleITK. If you load with nibabel,
+                     you need to transpose your axes AND your spacing from [x,y,z] to [z,y,x]!
+        image_properties must only have a 'spacing' key!
+        """
+        ppa = PreprocessAdapterFromNpy([input_image], [segmentation_previous_stage], [image_properties],
+                                       [output_file_truncated],
+                                       self.plans_manager, self.dataset_json, self.configuration_manager,
+                                       num_threads_in_multithreaded=1, verbose=self.verbose)
+        if self.verbose:
+            print('preprocessing')
+        dct = next(ppa)
+
+        if self.verbose:
+            print('predicting')
+        predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
+
+        if self.verbose:
+            print('resampling to original shape')
+        if output_file_truncated is not None:
+            export_prediction_from_logits(predicted_logits, dct['data_properties'], self.configuration_manager,
+                                          self.plans_manager, self.dataset_json, output_file_truncated,
+                                          save_or_return_probabilities)
+        else:
+            ret = convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits, self.plans_manager,
+                                                                              self.configuration_manager,
+                                                                              self.label_manager,
+                                                                              dct['data_properties'],
+                                                                              return_probabilities=
+                                                                              save_or_return_probabilities)
+            if save_or_return_probabilities:
+                return ret[0], ret[1]
+            else:
+                return ret
 
     @torch.inference_mode()
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
@@ -386,9 +536,12 @@ class nnUNetPredictor(object):
         RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
         SEE convert_predicted_logits_to_segmentation_with_correct_shape
         """
+        
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
+
+        start_time = time.time()  # 记录开始时间
 
         for params in self.list_of_parameters:
 
@@ -409,9 +562,15 @@ class nnUNetPredictor(object):
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
 
-        if self.verbose: print('Prediction done')
+        inference_time = time.time() - start_time  # 计算推理时间
+        self.inference_times.append(inference_time)  # 存储推理时间
+        print(f'Inference time: {inference_time:.4f} seconds')
+
+        if self.verbose: 
+            print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+
+        return prediction, inference_time  
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -589,9 +748,191 @@ class nnUNetPredictor(object):
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
 
+    def predict_from_files_sequential(self,
+                           list_of_lists_or_source_folder: Union[str, List[List[str]]],
+                           output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
+                           save_probabilities: bool = False,
+                           overwrite: bool = True,
+                           folder_with_segs_from_prev_stage: str = None):
+        """
+        Just like predict_from_files but doesn't use any multiprocessing. Slow, but sometimes necessary
+        """
+        if isinstance(output_folder_or_list_of_truncated_output_files, str):
+            output_folder = output_folder_or_list_of_truncated_output_files
+        elif isinstance(output_folder_or_list_of_truncated_output_files, list):
+            output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
+            if len(output_folder) == 0:  # just a file was given without a folder
+                output_folder = os.path.curdir
+        else:
+            output_folder = None
+
+        ########################
+        # let's store the input arguments so that its clear what was used to generate the prediction
+        if output_folder is not None:
+            my_init_kwargs = {}
+            for k in inspect.signature(self.predict_from_files_sequential).parameters.keys():
+                my_init_kwargs[k] = locals()[k]
+            my_init_kwargs = deepcopy(
+                my_init_kwargs)  # let's not unintentionally change anything in-place. Take this as a
+            recursive_fix_for_json_export(my_init_kwargs)
+            save_json(my_init_kwargs, join(output_folder, 'predict_from_raw_data_args.json'))
+
+            # we need these two if we want to do things with the predictions like for example apply postprocessing
+            save_json(self.dataset_json, join(output_folder, 'dataset.json'), sort_keys=False)
+            save_json(self.plans_manager.plans, join(output_folder, 'plans.json'), sort_keys=False)
+        #######################
+
+        # check if we need a prediction from the previous stage
+        if self.configuration_manager.previous_stage_name is not None:
+            assert folder_with_segs_from_prev_stage is not None, \
+                f'The requested configuration is a cascaded network. It requires the segmentations of the previous ' \
+                f'stage ({self.configuration_manager.previous_stage_name}) as input. Please provide the folder where' \
+                f' they are located via folder_with_segs_from_prev_stage'
+
+        # sort out input and output filenames
+        list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files = \
+            self._manage_input_and_output_lists(list_of_lists_or_source_folder,
+                                                output_folder_or_list_of_truncated_output_files,
+                                                folder_with_segs_from_prev_stage, overwrite, 0, 1,
+                                                save_probabilities)
+        if len(list_of_lists_or_source_folder) == 0:
+            return
+
+        label_manager = self.plans_manager.get_label_manager(self.dataset_json)
+        preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose)
+
+        if output_filename_truncated is None:
+            output_filename_truncated = [None] * len(list_of_lists_or_source_folder)
+        if seg_from_prev_stage_files is None:
+            seg_from_prev_stage_files = [None] * len(seg_from_prev_stage_files)
+
+        ret = []
+        for li, of, sps in zip(list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files):
+            data, seg, data_properties = preprocessor.run_case(
+                li,
+                sps,
+                self.plans_manager,
+                self.configuration_manager,
+                self.dataset_json
+            )
+
+            print(f'perform_everything_on_device: {self.perform_everything_on_device}')
+
+            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
+
+            if of is not None:
+                export_prediction_from_logits(prediction, data_properties, self.configuration_manager, self.plans_manager,
+                  self.dataset_json, of, save_probabilities)
+            else:
+                ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(prediction, self.plans_manager,
+                     self.configuration_manager, self.label_manager,
+                     data_properties,
+                     save_probabilities))
+
+        # clear lru cache
+        compute_gaussian.cache_clear()
+        # clear device cache
+        empty_cache(self.device)
+        return ret
+
+
+def predict_entry_point_modelfolder():
+    import argparse
+    parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
+                                                 'you want to manually specify a folder containing a trained nnU-Net '
+                                                 'model. This is useful when the nnunet environment variables '
+                                                 '(nnUNet_results) are not set.')
+    parser.add_argument('-i', type=str, required=True,
+                        help='input folder. Remember to use the correct channel numberings for your files (_0000 etc). '
+                             'File endings must be the same as the training dataset!')
+    parser.add_argument('-o', type=str, required=True,
+                        help='Output folder. If it does not exist it will be created. Predicted segmentations will '
+                             'have the same name as their source images.')
+    parser.add_argument('-m', type=str, required=True,
+                        help='Folder in which the trained model is. Must have subfolders fold_X for the different '
+                             'folds you trained')
+    parser.add_argument('-f', nargs='+', type=str, required=False, default=(0, 1, 2, 3, 4),
+                        help='Specify the folds of the trained model that should be used for prediction. '
+                             'Default: (0, 1, 2, 3, 4)')
+    parser.add_argument('-step_size', type=float, required=False, default=0.5,
+                        help='Step size for sliding window prediction. The larger it is the faster but less accurate '
+                             'the prediction. Default: 0.5. Cannot be larger than 1. We recommend the default.')
+    parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
+                        help='Set this flag to disable test time data augmentation in the form of mirroring. Faster, '
+                             'but less accurate inference. Not recommended.')
+    parser.add_argument('--verbose', action='store_true', help="Set this if you like being talked to. You will have "
+                                                               "to be a good listener/reader.")
+    parser.add_argument('--save_probabilities', action='store_true',
+                        help='Set this to export predicted class "probabilities". Required if you want to ensemble '
+                             'multiple configurations.')
+    parser.add_argument('--continue_prediction', '--c', action='store_true',
+                        help='Continue an aborted previous prediction (will not overwrite existing files)')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-npp', type=int, required=False, default=3,
+                        help='Number of processes used for preprocessing. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-nps', type=int, required=False, default=3,
+                        help='Number of processes used for segmentation export. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-prev_stage_predictions', type=str, required=False, default=None,
+                        help='Folder containing the predictions of the previous stage. Required for cascaded models.')
+    parser.add_argument('-device', type=str, default='cuda', required=False,
+                        help="Use this to set the device the inference should run with. Available options are 'cuda' "
+                             "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
+                             "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_predict [...] instead!")
+    parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
+                        help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
+                             'jobs)')
+
+    print(
+        "\n#######################################################################\nPlease cite the following paper "
+        "when using nnU-Net:\n"
+        "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
+        "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
+        "Nature methods, 18(2), 203-211.\n#######################################################################\n")
+
+    args = parser.parse_args()
+    args.f = [i if i == 'all' else int(i) for i in args.f]
+
+    if not isdir(args.o):
+        maybe_mkdir_p(args.o)
+
+    assert args.device in ['cpu', 'cuda',
+                           'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
+    if args.device == 'cpu':
+        # let's allow torch to use hella threads
+        import multiprocessing
+        torch.set_num_threads(multiprocessing.cpu_count())
+        device = torch.device('cpu')
+    elif args.device == 'cuda':
+        # multithreading in torch doesn't help nnU-Net if run on GPU
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        device = torch.device('cuda')
+    else:
+        device = torch.device('mps')
+
+    predictor = nnUNetPredictor(tile_step_size=args.step_size,
+                                use_gaussian=True,
+                                use_mirroring=not args.disable_tta,
+                                perform_everything_on_device=True,
+                                device=device,
+                                verbose=args.verbose,
+                                allow_tqdm=not args.disable_progress_bar,
+                                verbose_preprocessing=args.verbose)
+    predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
+    predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
+                                 overwrite=not args.continue_prediction,
+                                 num_processes_preprocessing=args.npp,
+                                 num_processes_segmentation_export=args.nps,
+                                 folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+                                 num_parts=1, part_id=0)
+
 
 def predict_entry_point():
     import argparse
+    
     parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
                                                  'you want to manually specify a folder containing a trained nnU-Net '
                                                  'model. This is useful when the nnunet environment variables '
@@ -700,6 +1041,8 @@ def predict_entry_point():
         args.f,
         checkpoint_name=args.chk
     )
+    
+    
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
@@ -707,3 +1050,63 @@ def predict_entry_point():
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=args.num_parts,
                                  part_id=args.part_id)
+    # r = predict_from_raw_data(args.i,
+    #                           args.o,
+    #                           model_folder,
+    #                           args.f,
+    #                           args.step_size,
+    #                           use_gaussian=True,
+    #                           use_mirroring=not args.disable_tta,
+    #                           perform_everything_on_device=True,
+    #                           verbose=args.verbose,
+    #                           save_probabilities=args.save_probabilities,
+    #                           overwrite=not args.continue_prediction,
+    #                           checkpoint_name=args.chk,
+    #                           num_processes_preprocessing=args.npp,
+    #                           num_processes_segmentation_export=args.nps,
+    #                           folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+    #                           num_parts=args.num_parts,
+    #                           part_id=args.part_id,
+    #                           device=device)
+
+
+if __name__ == '__main__':
+    ########################## predict a bunch of files
+    from nnunetv2.paths import nnUNet_results, nnUNet_raw
+
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=True,
+        perform_everything_on_device=True,
+        device=torch.device('cuda', 0),
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=True
+    )
+    predictor.initialize_from_trained_model_folder(
+        join(nnUNet_results, 'Dataset004_Hippocampus/nnUNetTrainer_5epochs__nnUNetPlans__3d_fullres'),
+        use_folds=(0,),
+        checkpoint_name='checkpoint_final.pth',
+    )
+    # predictor.predict_from_files(join(nnUNet_raw, 'Dataset003_Liver/imagesTs'),
+    #                              join(nnUNet_raw, 'Dataset003_Liver/imagesTs_predlowres'),
+    #                              save_probabilities=False, overwrite=False,
+    #                              num_processes_preprocessing=2, num_processes_segmentation_export=2,
+    #                              folder_with_segs_from_prev_stage=None, num_parts=1, part_id=0)
+    #
+    # # predict a numpy array
+    # from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
+    #
+    # img, props = SimpleITKIO().read_images([join(nnUNet_raw, 'Dataset003_Liver/imagesTr/liver_63_0000.nii.gz')])
+    # ret = predictor.predict_single_npy_array(img, props, None, None, False)
+    #
+    # iterator = predictor.get_data_iterator_from_raw_npy_data([img], None, [props], None, 1)
+    # ret = predictor.predict_from_data_iterator(iterator, False, 1)
+
+    ret = predictor.predict_from_files_sequential(
+        [['/media/isensee/raw_data/nnUNet_raw/Dataset004_Hippocampus/imagesTs/hippocampus_002_0000.nii.gz'], ['/media/isensee/raw_data/nnUNet_raw/Dataset004_Hippocampus/imagesTs/hippocampus_005_0000.nii.gz']],
+        '/home/isensee/temp/tmp', False, True, None
+    )
+
+

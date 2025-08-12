@@ -95,9 +95,11 @@ predict_results/
 *.memmap
 *.png
 *.zip
+*.csv
 *.npz
 *.npy
 *.pkl
+*.pth
 *.log
 *.jpg
 *.jpeg
