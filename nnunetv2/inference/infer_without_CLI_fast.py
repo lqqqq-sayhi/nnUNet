@@ -12,6 +12,7 @@ CUDA_VISIBLE_DEVICES=1 python3 /home/lq/Projects_qin/surgical_semantic_seg/benma
 """
 
 import argparse
+import glob
 import torch
 from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p, isdir, join
 from nnunetv2.utilities.file_path_utilities import get_output_folder
@@ -49,7 +50,7 @@ if __name__ == "__main__":
     # instantiate fast predictor
     predictor = FastNNUNetPredictor(device=device,
                                     use_gaussian=args.use_gaussian,
-                                    use_mirroring=False,
+                                    use_mirroring=False, # sacrifice the quality of the segmentation by disabling Test Time Augmentation
                                     tile_step_size=0.5,
                                     verbose=False,
                                     verbose_preprocessing=False,
@@ -73,7 +74,24 @@ if __name__ == "__main__":
             import numpy as _np
             write_dtype = _np.uint8
 
-    # run predictions over the folder
-    predictor.predict_from_folder(args.i, args.o, file_pattern=args.pattern,
-                                  num_processes_preprocessing=1,
-                                  write_dtype=write_dtype)
+    # # run predictions over the folder
+    # predictor.predict_from_folder(args.i, args.o, file_pattern=args.pattern,
+    #                               num_processes_preprocessing=1,
+    #                               write_dtype=write_dtype)
+
+    # 构建输入文件列表
+    file_list = sorted(glob.glob(join(args.i, args.pattern)))
+    list_of_lists = [[file] for file in file_list]  # 每个案例一个列表，包含其文件
+
+    # 运行预测
+    predictor.predict_from_files(
+        list_of_lists, 
+        args.o, 
+        save_probabilities=False,
+        overwrite=True,
+        num_processes_preprocessing=1, # 进程数设为1以加速流程
+        num_processes_segmentation_export=1,  # 进程数设为1以加速流程
+        folder_with_segs_from_prev_stage=None,
+        num_parts=1,
+        part_id=0
+    )

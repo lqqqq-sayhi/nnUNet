@@ -1,8 +1,9 @@
 """
 nnUNetv2_predict -d 3 -f 0 -c 3d_lowres -i imagesTs -o imagesTs_predlowres --continue_prediction
+
 CUDA_VISIBLE_DEVICES=1 python3 /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/nnUNet/nnunetv2/inference/infer_without_CLI.py \
--i /mnt/hdd2/task2/nnunet/test_func/imagesTs \
--o /mnt/hdd2/task2/nnunet/predict_results/test_func \
+-i /mnt/hdd2/task2/nnunet/Dataset007_task2_Ts/imagesTs \
+-o /mnt/hdd2/task2/nnunet/predict_results/mask_results_0 \
 -d 007 -c 2d -f 0
 """
 
@@ -119,7 +120,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
 
-    model_folder = get_output_folder(args.d, args.tr, args.p, args.c)
+    model_folder = get_output_folder(
+        args.d, 
+        args.tr, 
+        args.p, 
+        args.c
+    )
 
     if not isdir(args.o):
         maybe_mkdir_p(args.o)
